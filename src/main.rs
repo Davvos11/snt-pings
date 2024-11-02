@@ -1,10 +1,10 @@
-use image::GenericImageView;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::thread::sleep;
 use std::time::Duration;
 use clap::Parser;
 use rand::Rng;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
