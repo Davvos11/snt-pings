@@ -2,24 +2,33 @@ use image::GenericImageView;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::thread::sleep;
 use std::time::Duration;
+use clap::Parser;
 use rand::Rng;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    filename: String,
+    x: usize,
+    y: usize,
+    #[arg(short, long, default_value = "5")]
+    timeout: u64,
+}
 
 fn main() {
-    let img = image::open("vck_dm.png").expect("Failed to open image");
-    let rgba_data = img.to_rgba8().into_raw();
-    let (width, height) = img.dimensions();
-    let (width, height) = (width as usize, height as usize);
+    let args = Args::parse();
 
-    let coords = (250, 250);
+    let img = image::open(args.filename).expect("Failed to open image");
+    let rgba_data = img.to_rgba8().into_raw();
+    let width = img.width() as usize;
 
     let addresses: Vec<_> = rgba_data
         .chunks(4)
         .enumerate()
         .filter(|(_, rgba)| rgba[3] > 0)
         .map(|(i, rgba)| {
-            let x = coords.0 + (i % width);
-            let y = coords.1 + (i / width);
+            let x = args.x + (i % width);
+            let y = args.y + (i / width);
             let addr = Ipv6Addr::new(0x2001, 0x610, 0x1908, 0xa000,
                                      x as u16, y as u16,
                                      (rgba[2] as u16) << 8 | rgba[1] as u16,
@@ -50,6 +59,8 @@ fn main() {
         let address = addresses[random_index];
 
         socket.send_to(&packet, &SockAddr::from(address)).expect("Failed to send packet");
-        sleep(Duration::from_millis(10));
+        if args.timeout > 0 {
+            sleep(Duration::from_millis(args.timeout));
+        }
     }
 }
