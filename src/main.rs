@@ -11,7 +11,7 @@ struct Args {
     filename: String,
     x: usize,
     y: usize,
-    #[arg(short, long, default_value = "5")]
+    #[arg(short, long, default_value = "500")]
     timeout: u64,
 }
 
@@ -58,9 +58,12 @@ fn main() {
         let random_index = rand::thread_rng().gen_range(0..addresses.len());
         let address = addresses[random_index];
 
-        socket.send_to(&packet, &SockAddr::from(address)).expect("Failed to send packet");
+        if let Err(e) = socket.send_to(&packet, &SockAddr::from(address)) {
+            println!("Failed to send packet: {:?}", e);
+            sleep(Duration::from_secs(1));
+        }
         if args.timeout > 0 {
-            sleep(Duration::from_millis(args.timeout));
+            sleep(Duration::from_micros(args.timeout));
         }
     }
 }

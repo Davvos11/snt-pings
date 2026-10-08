@@ -2,10 +2,10 @@
 
 ## Usage:
 ```shell
-cargo run --release -- filename.png x y --timeout secs
+cargo run --release -- filename.png x y --timeout microsecs
 ```
 Or:
 ```shell
 cargo build --release
-./target/release/snt-pings filename.png x y --timeout secs
+./target/release/snt-pings filename.png x y --timeout microsecs
 ```
