@@ -3,6 +3,7 @@ use rand::prelude::SliceRandom;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use spin_sleep::SpinSleeper;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ struct Args {
     /// Target bitrate in Mb/s
     #[arg(short, long)]
     mbps: Option<f32>,
+    #[arg(short, long, default_value = "1")]
+    threads: usize,
 }
 
 fn main() {
@@ -26,7 +29,7 @@ fn main() {
     let rgba_data = img.to_rgba8().into_raw();
     let width = img.width() as usize;
 
-    let mut addresses: Vec<_> = rgba_data
+    let addresses: Vec<_> = rgba_data
         .chunks(4)
         .enumerate()
         .filter(|(_, rgba)| rgba[3] > 0)
@@ -49,11 +52,25 @@ fn main() {
 
     dbg!(addresses.len());
 
-    let mut rng = rand::rng();
-    addresses.shuffle(&mut rng);
+    let interval: Option<Duration> = args.mbps.map(|mbps| {
+        let packets_per_sec = (mbps * 1_000_000.0) / 8.0 / PACKET_SIZE;
+        Duration::from_secs_f32(1.0 / packets_per_sec)
+    });
 
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))
-        .expect("Could not open socket");
+    let threads: Vec<_> = (0..args.threads).map(|_| {
+        let addresses = addresses.clone();
+        thread::spawn(move || {run(addresses, interval)})
+    }).collect();
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+}
+
+fn run(addresses: Vec<SocketAddr>, interval: Option<Duration>) {
+    let mut rng = rand::rng();
+    let mut addresses = addresses;
+    addresses.shuffle(&mut rng);
 
     // Create an ICMPv6 Echo Request packet
     let mut packet = [0u8; 8];
@@ -66,10 +83,8 @@ fn main() {
     packet[6] = 0; // Sequence Number (low byte)
     packet[7] = 1; // Sequence Number (high byte)
 
-    let interval: Option<Duration> = args.mbps.map(|mbps| {
-        let packets_per_sec = (mbps * 1_000_000.0) / 8.0 / PACKET_SIZE;
-        Duration::from_secs_f32(1.0 / packets_per_sec)
-    });
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))
+        .expect("Could not open socket");
 
     let sleeper = SpinSleeper::default();
     let mut next = Instant::now();
@@ -92,4 +107,5 @@ fn main() {
             }
         }
     }
+
 }
