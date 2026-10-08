@@ -2,7 +2,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::thread::sleep;
 use std::time::Duration;
 use clap::Parser;
-use rand::Rng;
+use rand::prelude::SliceRandom;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 #[derive(Parser, Debug)]
@@ -22,7 +22,7 @@ fn main() {
     let rgba_data = img.to_rgba8().into_raw();
     let width = img.width() as usize;
 
-    let addresses: Vec<_> = rgba_data
+    let mut addresses: Vec<_> = rgba_data
         .chunks(4)
         .enumerate()
         .filter(|(_, rgba)| rgba[3] > 0)
@@ -40,6 +40,9 @@ fn main() {
 
     dbg!(addresses.len());
 
+    let mut rng = rand::rng();
+    addresses.shuffle(&mut rng);
+
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))
         .expect("Could not open socket");
 
@@ -54,11 +57,8 @@ fn main() {
     packet[6] = 0;   // Sequence Number (low byte)
     packet[7] = 1;   // Sequence Number (high byte)
 
-    loop {
-        let random_index = rand::thread_rng().gen_range(0..addresses.len());
-        let address = addresses[random_index];
-
-        if let Err(e) = socket.send_to(&packet, &SockAddr::from(address)) {
+    for address in addresses.iter().cycle() {
+        if let Err(e) = socket.send_to(&packet, &SockAddr::from(*address)) {
             println!("Failed to send packet: {:?}", e);
             sleep(Duration::from_secs(1));
         }
