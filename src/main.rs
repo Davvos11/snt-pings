@@ -39,8 +39,8 @@ fn main() {
             let addr = Ipv6Addr::new(
                 0x2001,
                 0x610,
-                0x1908,
-                0xa000,
+                0x5ea,
+                0x221e,
                 x as u16,
                 y as u16,
                 (rgba[2] as u16) << 8 | rgba[1] as u16,
@@ -90,11 +90,20 @@ fn run(addresses: Vec<SocketAddr>, interval: Option<Duration>) {
     let mut next = Instant::now();
 
     for address in addresses.iter().cycle() {
-        if let Err(e) = socket.send_to(&packet, &SockAddr::from(*address)) {
-            println!("Failed to send packet: {:?}", e);
-            sleep(Duration::from_secs(1));
-            next = Instant::now();
-            continue;
+        loop {
+            match socket.send_to(&packet, &SockAddr::from(*address)) {
+                Ok(_) => break,
+                // Send buffer full: back off very briefly and retry the same address.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    sleeper.sleep(Duration::from_micros(50));
+                }
+                Err(e) => {
+                    println!("Failed to send packet: {:?}", e);
+                    sleep(Duration::from_secs(1));
+                    next = Instant::now();
+                    break;
+                }
+            }
         }
         // Sleep if needed (i.e. if we are quicker than the target Mb/s)
         if let Some(interval) = interval {
