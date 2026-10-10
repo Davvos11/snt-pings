@@ -73,6 +73,11 @@ struct Args {
     #[arg(long)]
     height: Option<u32>,
 
+    /// Crop a region out of the source before resizing. Geometry is WxH+X+Y
+    /// (e.g. 200x150+40+10) or WxH (offset 0,0). Applied before --width/--height.
+    #[arg(long)]
+    crop: Option<String>,
+
     /// Force copy mode instead of zero-copy (use if zero-copy bind fails).
     #[arg(long)]
     copy: bool,
@@ -102,6 +107,14 @@ fn main() {
         .expect("Failed to read image header")
         .decode()
         .expect("Failed to decode image");
+    // Crop first (region in source pixels), then resize.
+    let img = match &args.crop {
+        None => img,
+        Some(spec) => {
+            let (w, h, x, y) = parse_crop(spec).expect("invalid --crop (want WxH+X+Y or WxH)");
+            img.crop_imm(x, y, w, h)
+        }
+    };
     let img = match (args.width, args.height) {
         (None, None) => img,
         (w, h) => {
@@ -371,9 +384,36 @@ fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
     parse_mac(s.trim())
 }
 
+/// Parse a crop geometry: "WxH+X+Y" or "WxH" (offset defaults to 0,0).
+/// Returns (width, height, x, y).
+fn parse_crop(s: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut it = s.split('+');
+    let wh = it.next()?;
+    let (w, h) = wh.split_once('x')?;
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    let x: u32 = it.next().map_or(Ok(0), str::parse).ok()?;
+    let y: u32 = it.next().map_or(Ok(0), str::parse).ok()?;
+    if it.next().is_some() || w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h, x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_geometry_parses() {
+        assert_eq!(parse_crop("200x150+40+10"), Some((200, 150, 40, 10)));
+        assert_eq!(parse_crop("200x150"), Some((200, 150, 0, 0)));
+        assert_eq!(parse_crop("200x150+40"), Some((200, 150, 40, 0)));
+        assert_eq!(parse_crop("0x10"), None);
+        assert_eq!(parse_crop("200"), None);
+        assert_eq!(parse_crop("200x150+40+10+5"), None);
+        assert_eq!(parse_crop("axb+0+0"), None);
+    }
 
     #[test]
     fn checksum_is_valid() {

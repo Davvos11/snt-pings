@@ -4,13 +4,18 @@
 # up to date for pingflood's watch mode.
 #
 # Usage:
-#   ./webcam.sh URL X Y [OUT.bin] [INTERVAL_SECONDS] [SIZE]
+#   ./webcam.sh URL X Y [OUT.bin] [INTERVAL_SECONDS] [SIZE] [CROP]
 #
 # SIZE scales the image on the canvas: WxH (exact), W (width, keep aspect),
 # or xH (height, keep aspect). May also be set via WIDTH/HEIGHT env vars.
+# CROP cuts a region from the source first: WxH+X+Y (or WxH at 0,0). Crop is
+# applied before resize. May also be set via the CROP env var.
 #
 # Example (place the webcam at canvas 800,600, 400px wide, refresh every 1s):
 #   ./webcam.sh 'https://www.vestingbar.nl/webcam-images/image.jpg' 800 600 '' 1 400
+#
+# Example (crop a 960x540 region at 480,270, then scale to 400px wide):
+#   ./webcam.sh 'https://.../image.jpg' 800 600 '' 1 400 960x540+480+270
 #
 # Then, in another shell, flood it with live reload (note the '@' = watch):
 #   sudo dpdk/pingflood -l 0-3 -n 4 -a 0000:06:00.0 -- @frames/webcam.bin
@@ -34,6 +39,7 @@ Y="${3:?need Y}"
 OUT="${4:-$ROOT/frames/webcam.bin}"
 INTERVAL="${5:-1}"
 SIZE="${6:-}"
+: "${CROP:=${7:-}}"   # positional CROP (WxH+X+Y) or CROP env var
 
 # Resolve size: positional SIZE (WxH / W / xH) overrides WIDTH/HEIGHT env vars.
 : "${WIDTH:=}"
@@ -44,9 +50,10 @@ if [[ -n "$SIZE" ]]; then
         *)   WIDTH="$SIZE" ;;
     esac
 fi
-resize_args=()
-[[ -n "$WIDTH"  ]] && resize_args+=(--width  "$WIDTH")
-[[ -n "$HEIGHT" ]] && resize_args+=(--height "$HEIGHT")
+edit_args=()
+[[ -n "$CROP"   ]] && edit_args+=(--crop   "$CROP")
+[[ -n "$WIDTH"  ]] && edit_args+=(--width  "$WIDTH")
+[[ -n "$HEIGHT" ]] && edit_args+=(--height "$HEIGHT")
 
 # Build afxdp if needed (we only use its --dump path; no NIC touched here).
 [[ -x "$AFXDP" ]] || { echo ">> building afxdp"; (cd "$ROOT" && cargo build --release --bin afxdp); }
@@ -80,7 +87,7 @@ while true; do
         tmpbin="$(mktemp "${OUT}.XXXXXX")"
         if "$AFXDP" "$jpg" "$X" "$Y" \
                --dst-mac "$DST_MAC" --src-mac "$SRC_MAC" --src-ip "$SRC_IP" \
-               ${resize_args[@]+"${resize_args[@]}"} --dump "$tmpbin" >/dev/null 2>&1; then
+               ${edit_args[@]+"${edit_args[@]}"} --dump "$tmpbin" >/dev/null 2>&1; then
             mv -f "$tmpbin" "$OUT"
         else
             echo ">> convert failed (bad/empty image?), keeping previous frames" >&2

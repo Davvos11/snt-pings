@@ -6,10 +6,12 @@
 #   ./flood.sh ITEM [ITEM ...]
 #
 # Each ITEM is one of:
-#   IMAGE:X:Y          a static image to place at canvas (X,Y)
-#   IMAGE:X:Y:SIZE     ... resized first; SIZE is WxH (exact), W (keep aspect)
-#                          or xH (keep aspect)
-#   FRAMES.bin         a pre-built frame file (no ':'), passed through and
+#   IMAGE:X:Y             a static image to place at canvas (X,Y)
+#   IMAGE:X:Y:SIZE        ... resized; SIZE is WxH (exact), W or xH (keep aspect)
+#   IMAGE:X:Y:SIZE:CROP   ... cropped first; CROP is WxH+X+Y (or WxH at 0,0).
+#                             Leave SIZE empty to crop without resizing, e.g.
+#                             IMAGE:X:Y::200x150+10+10
+#   FRAMES.bin            a pre-built frame file (no ':'), passed through and
 #                          WATCHED for live reload -- e.g. one kept fresh by
 #                          webcam.sh. Produce it separately; flood.sh won't.
 #
@@ -61,30 +63,31 @@ args=()
 i=0
 for item in "$@"; do
     if [[ "$item" == *:* ]]; then
-        # IMAGE:X:Y[:SIZE] -> dump to a frame file.
-        IFS=':' read -r img x y size <<< "$item"
+        # IMAGE:X:Y[:SIZE[:CROP]] -> dump to a frame file.
+        IFS=':' read -r img x y size crop <<< "$item"
         if [[ -z "${img:-}" || -z "${x:-}" || -z "${y:-}" ]]; then
-            echo "bad spec '$item' (expected IMAGE:X:Y[:SIZE])" >&2
+            echo "bad spec '$item' (expected IMAGE:X:Y[:SIZE[:CROP]])" >&2
             exit 1
         fi
         img="$(resolve "$img")"
         [[ -f "$img" ]] || { echo "image not found: $img" >&2; exit 1; }
 
-        resize_args=()
+        edit_args=()
+        [[ -n "${crop:-}" ]] && edit_args+=(--crop "$crop")
         if [[ -n "${size:-}" ]]; then
             case "$size" in
                 *x*) w="${size%x*}"; h="${size#*x}" ;;
                 *)   w="$size"; h="" ;;
             esac
-            [[ -n "$w" ]] && resize_args+=(--width  "$w")
-            [[ -n "$h" ]] && resize_args+=(--height "$h")
+            [[ -n "$w" ]] && edit_args+=(--width  "$w")
+            [[ -n "$h" ]] && edit_args+=(--height "$h")
         fi
 
         out="$FRAMEDIR/frames_$i.bin"
-        echo ">> $img at ($x,$y)${size:+ size $size} -> $out"
+        echo ">> $img at ($x,$y)${size:+ size $size}${crop:+ crop $crop} -> $out"
         "$AFXDP" "$img" "$x" "$y" \
             --dst-mac "$DST_MAC" --src-mac "$SRC_MAC" --src-ip "$SRC_IP" \
-            ${resize_args[@]+"${resize_args[@]}"} --dump "$out"
+            ${edit_args[@]+"${edit_args[@]}"} --dump "$out"
         args+=("$out")
     else
         # Pre-built frame file: pass through and WATCH it for live reload.
