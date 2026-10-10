@@ -16,18 +16,36 @@
  *            -a   PCI address of the VF (after binding it to vfio-pci)
  *            --   everything after is this app's args: one or more frame files
  *
+ * Live reload (for a webcam / changing image):
+ *   Prefix a frame file with '@' to WATCH it. A background thread re-reads the
+ *   file whenever its mtime changes and hot-swaps it in with no restart, so a
+ *   separate poller (see webcam.sh) can keep it fresh:
+ *     sudo ./pingflood -l 0-3 -n 4 -a 0000:06:00.0 -- @frames/webcam.bin
+ *   The poller must write the new frames and then atomically rename over the
+ *   file (same filesystem) so a half-written file is never observed.
+ *
  * Core assignment:
- *   1 file     : every core floods it (frame table partitioned across cores).
+ *   1 file     : every core floods it.
  *   N files    : the first N-1 files get ONE core each; the last file gets all
  *                remaining cores. So `-- A.bin B.bin` => A on 1 core, B on the
  *                rest (e.g. 3 cores on a 4-core box).
+ *
+ * Each core cycles the whole current frame table (with a per-core phase offset).
+ * For a fixed total packet rate the per-pixel refresh rate is the same whether
+ * cores partition the table or overlap on it, so overlapping keeps reload
+ * trivially correct even when a reloaded image has a different pixel count.
  */
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -42,14 +60,24 @@
 #define NB_RXD 128
 #define MBUF_CACHE 256
 #define MAX_IMAGES 16
+#define RELOAD_POLL_US 200000   /* how often the watcher stats watched files */
+#define RELOAD_GRACE_US 200000  /* wait after a swap before freeing the old table */
 
 static volatile int force_quit;
 
-/* One loaded image = a frame table shared read-only across the cores using it. */
-struct image {
-    uint8_t *frames;
+/* An immutable, atomically-swappable frame table. */
+struct frame_table {
+    uint8_t *frames; /* n * FRAME_LEN bytes */
     uint32_t n;
+};
+
+/* One image slot. `tbl` is swapped atomically by the watcher thread; the TX
+ * loops read it (acquire) once per burst. */
+struct image {
+    struct frame_table *_Atomic tbl;
     const char *path;
+    int watch;        /* reload when the file mtime changes */
+    time_t mtime;     /* last-loaded mtime (watcher thread only) */
 };
 static struct image g_img[MAX_IMAGES];
 static int g_nimg;
@@ -57,12 +85,11 @@ static int g_nimg;
 static struct rte_mempool *g_mp;
 static uint16_t g_port;
 
-/* Per-lcore work: which TX queue, which image, and which slice of it to cycle. */
+/* Per-lcore work: which TX queue, which image, and a starting phase offset. */
 struct lcore_cfg {
     uint16_t queue_id;
     int      img;
-    uint32_t start;
-    uint32_t count;
+    uint32_t phase;
     int      active;
 };
 static struct lcore_cfg g_cfg[RTE_MAX_LCORE];
@@ -73,30 +100,101 @@ static void handle_signal(int sig)
     force_quit = 1;
 }
 
-/* Load one dump file (N * 62 bytes) into an image slot. */
-static void load_image(int slot, const char *path)
+/* Read a dump file (N * 62 bytes) into a freshly allocated frame table.
+ * Returns NULL on any error (caller decides whether that is fatal). */
+static struct frame_table *load_table(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f)
-        rte_exit(EXIT_FAILURE, "cannot open frames file '%s'\n", path);
+        return NULL;
 
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || (sz % FRAME_LEN) != 0)
-        rte_exit(EXIT_FAILURE, "frames file '%s' size %ld not a multiple of %d\n",
-                 path, sz, FRAME_LEN);
+    if (sz <= 0 || (sz % FRAME_LEN) != 0) {
+        fclose(f);
+        return NULL;
+    }
 
-    g_img[slot].frames = malloc(sz);
-    if (!g_img[slot].frames)
-        rte_exit(EXIT_FAILURE, "out of memory loading '%s'\n", path);
-    if (fread(g_img[slot].frames, 1, sz, f) != (size_t)sz)
-        rte_exit(EXIT_FAILURE, "short read on '%s'\n", path);
+    struct frame_table *t = malloc(sizeof(*t));
+    if (!t) {
+        fclose(f);
+        return NULL;
+    }
+    t->frames = malloc(sz);
+    if (!t->frames) {
+        free(t);
+        fclose(f);
+        return NULL;
+    }
+    if (fread(t->frames, 1, sz, f) != (size_t)sz) {
+        free(t->frames);
+        free(t);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
+    t->n = (uint32_t)(sz / FRAME_LEN);
+    return t;
+}
 
-    g_img[slot].n = (uint32_t)(sz / FRAME_LEN);
+/* Initial, fatal-on-error load of an image slot. */
+static void load_image(int slot, const char *path, int watch)
+{
+    struct frame_table *t = load_table(path);
+    if (!t)
+        rte_exit(EXIT_FAILURE,
+                 "cannot load frames file '%s' (missing, empty, or size not a "
+                 "multiple of %d)\n", path, FRAME_LEN);
+
+    atomic_store_explicit(&g_img[slot].tbl, t, memory_order_release);
     g_img[slot].path = path;
-    printf("image %d: %u frames from %s\n", slot, g_img[slot].n, path);
+    g_img[slot].watch = watch;
+
+    struct stat st;
+    g_img[slot].mtime = (stat(path, &st) == 0) ? st.st_mtime : 0;
+
+    printf("image %d: %u frames from %s%s\n", slot, t->n, path,
+           watch ? " (watched)" : "");
+}
+
+/* Background thread: poll watched files for mtime changes and hot-swap them. */
+static void *reloader(void *arg)
+{
+    (void)arg;
+    while (!force_quit) {
+        for (int i = 0; i < g_nimg; i++) {
+            if (!g_img[i].watch)
+                continue;
+            struct stat st;
+            if (stat(g_img[i].path, &st) != 0)
+                continue;
+            if (st.st_mtime == g_img[i].mtime)
+                continue;
+
+            struct frame_table *nt = load_table(g_img[i].path);
+            if (!nt) {
+                /* Likely caught mid-write; try again next tick without
+                 * updating mtime so we keep retrying. */
+                continue;
+            }
+            struct frame_table *old =
+                atomic_exchange_explicit(&g_img[i].tbl, nt, memory_order_acq_rel);
+            g_img[i].mtime = st.st_mtime;
+            printf("image %d reloaded: %u frames from %s\n", i, nt->n,
+                   g_img[i].path);
+
+            /* Let any TX loop that already read `old` finish its burst copy
+             * (microseconds) before freeing it. */
+            usleep(RELOAD_GRACE_US);
+            if (old) {
+                free(old->frames);
+                free(old);
+            }
+        }
+        usleep(RELOAD_POLL_US);
+    }
+    return NULL;
 }
 
 /* Configure the port with one TX queue per lcore. */
@@ -142,30 +240,37 @@ static void port_init(uint16_t port, uint16_t nb_txq)
 }
 
 /* Per-lcore TX loop: allocate a burst, copy template frames in, transmit,
- * repeat forever. Fresh mbufs each burst means the NIC owns and frees them
- * after TX — no in-flight reuse hazard. */
+ * repeat forever. The current frame table is re-read (acquire) each burst so a
+ * hot-swap by the watcher thread is picked up immediately. Fresh mbufs each
+ * burst means the NIC owns and frees them after TX — no in-flight reuse
+ * hazard. */
 static int tx_loop(__rte_unused void *arg)
 {
     unsigned lid = rte_lcore_id();
     struct lcore_cfg *cfg = &g_cfg[lid];
-    if (!cfg->active || cfg->count == 0)
+    if (!cfg->active)
         return 0;
 
     const uint16_t q = cfg->queue_id;
-    const uint8_t *table = g_img[cfg->img].frames;
-    const uint32_t start = cfg->start;
-    const uint32_t end = cfg->start + cfg->count;
-    uint32_t idx = start;
+    struct image *img = &g_img[cfg->img];
+    uint32_t idx = cfg->phase;
 
     struct rte_mbuf *bufs[TX_BURST];
     uint64_t sent = 0;
     const uint64_t hz = rte_get_tsc_hz();
     uint64_t last = rte_get_tsc_cycles();
 
-    printf("lcore %u -> TX queue %u, image %d frames [%u, %u)\n",
-           lid, q, cfg->img, start, end);
+    printf("lcore %u -> TX queue %u, image %d (phase %u)\n",
+           lid, q, cfg->img, cfg->phase);
 
     while (!force_quit) {
+        struct frame_table *t =
+            atomic_load_explicit(&img->tbl, memory_order_acquire);
+        const uint8_t *table = t->frames;
+        const uint32_t n = t->n;
+        if (idx >= n)
+            idx = 0;
+
         if (rte_pktmbuf_alloc_bulk(g_mp, bufs, TX_BURST) != 0)
             continue; /* pool momentarily drained; retry */
 
@@ -174,15 +279,15 @@ static int tx_loop(__rte_unused void *arg)
             rte_memcpy(d, table + (size_t)idx * FRAME_LEN, FRAME_LEN);
             bufs[i]->data_len = FRAME_LEN;
             bufs[i]->pkt_len = FRAME_LEN;
-            if (++idx >= end)
-                idx = start;
+            if (++idx >= n)
+                idx = 0;
         }
 
         uint16_t nb = 0;
         while (nb < TX_BURST) {
-            uint16_t n = rte_eth_tx_burst(g_port, q, &bufs[nb], TX_BURST - nb);
-            nb += n;
-            if (n == 0 && force_quit)
+            uint16_t sn = rte_eth_tx_burst(g_port, q, &bufs[nb], TX_BURST - nb);
+            nb += sn;
+            if (sn == 0 && force_quit)
                 break;
         }
         sent += nb;
@@ -200,24 +305,6 @@ static int tx_loop(__rte_unused void *arg)
     return 0;
 }
 
-/* Partition image `img` across lcores[from..to). */
-static void assign_partition(const unsigned *lcores, unsigned from, unsigned to,
-                             int img)
-{
-    unsigned ncores = to - from;
-    uint32_t total = g_img[img].n;
-    uint32_t chunk = total / ncores;
-    for (unsigned k = 0; k < ncores; k++) {
-        unsigned lid = lcores[from + k];
-        uint32_t s = k * chunk;
-        uint32_t c = (k == ncores - 1) ? (total - s) : chunk;
-        g_cfg[lid].img = img;
-        g_cfg[lid].start = s;
-        g_cfg[lid].count = c;
-        g_cfg[lid].active = 1;
-    }
-}
-
 int main(int argc, char **argv)
 {
     int ret = rte_eal_init(argc, argv);
@@ -230,14 +317,22 @@ int main(int argc, char **argv)
         rte_exit(EXIT_FAILURE,
                  "usage: %s [EAL args] -- <frames1> [frames2 ...]\n"
                  "  1 file : all cores flood it\n"
-                 "  N files: first N-1 files get 1 core each, last gets the rest\n",
+                 "  N files: first N-1 files get 1 core each, last gets the rest\n"
+                 "  prefix a file with '@' to watch it and hot-reload on change\n",
                  argv[0]);
 
     g_nimg = argc - 1;
     if (g_nimg > MAX_IMAGES)
         rte_exit(EXIT_FAILURE, "too many images (max %d)\n", MAX_IMAGES);
-    for (int i = 0; i < g_nimg; i++)
-        load_image(i, argv[1 + i]);
+    for (int i = 0; i < g_nimg; i++) {
+        const char *arg = argv[1 + i];
+        int watch = 0;
+        if (arg[0] == '@') {       /* '@path' => watch this file */
+            watch = 1;
+            arg++;
+        }
+        load_image(i, arg, watch);
+    }
 
     force_quit = 0;
     signal(SIGINT, handle_signal);
@@ -269,24 +364,49 @@ int main(int argc, char **argv)
 
     port_init(g_port, (uint16_t)nl);
 
-    /* Assign cores to images. */
+    /* Assign cores to images. Each core cycles the whole table with a distinct
+     * phase offset so they don't all send the same frame at the same instant. */
     if (g_nimg == 1) {
-        assign_partition(lcores, 0, nl, 0);
+        for (unsigned k = 0; k < nl; k++) {
+            unsigned l = lcores[k];
+            g_cfg[l].img = 0;
+            g_cfg[l].active = 1;
+        }
     } else {
         /* first N-1 images: one core each */
         for (int i = 0; i < g_nimg - 1; i++) {
             unsigned l = lcores[i];
             g_cfg[l].img = i;
-            g_cfg[l].start = 0;
-            g_cfg[l].count = g_img[i].n;
             g_cfg[l].active = 1;
         }
         /* last image: all remaining cores */
-        assign_partition(lcores, g_nimg - 1, nl, g_nimg - 1);
+        for (unsigned k = g_nimg - 1; k < nl; k++) {
+            unsigned l = lcores[k];
+            g_cfg[l].img = g_nimg - 1;
+            g_cfg[l].active = 1;
+        }
     }
+    /* Spread phase offsets across the cores sharing an image. */
+    for (unsigned k = 0; k < nl; k++) {
+        unsigned l = lcores[k];
+        struct frame_table *t =
+            atomic_load_explicit(&g_img[g_cfg[l].img].tbl, memory_order_acquire);
+        g_cfg[l].phase = t->n ? (uint32_t)((uint64_t)k * t->n / nl) % t->n : 0;
+    }
+
+    /* Start the file watcher only if at least one image is watched. */
+    pthread_t watcher;
+    int have_watch = 0;
+    for (int i = 0; i < g_nimg; i++)
+        have_watch |= g_img[i].watch;
+    if (have_watch && pthread_create(&watcher, NULL, reloader, NULL) != 0)
+        rte_exit(EXIT_FAILURE, "could not start reloader thread\n");
 
     rte_eal_mp_remote_launch(tx_loop, NULL, CALL_MAIN);
     rte_eal_mp_wait_lcore();
+
+    if (have_watch)
+        pthread_join(watcher, NULL);
 
     rte_eth_dev_stop(g_port);
     rte_eth_dev_close(g_port);

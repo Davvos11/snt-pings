@@ -63,6 +63,16 @@ struct Args {
     #[arg(long, default_value = "fe80::1")]
     src_ip: Ipv6Addr,
 
+    /// Resize the image to this width (pixels) before encoding. If --height is
+    /// omitted the aspect ratio is preserved.
+    #[arg(long)]
+    width: Option<u32>,
+
+    /// Resize the image to this height (pixels) before encoding. If --width is
+    /// omitted the aspect ratio is preserved.
+    #[arg(long)]
+    height: Option<u32>,
+
     /// Force copy mode instead of zero-copy (use if zero-copy bind fails).
     #[arg(long)]
     copy: bool,
@@ -85,6 +95,21 @@ fn main() {
 
     // ---- pixel -> destination address encoding (same scheme as main.rs) ----
     let img = image::open(&args.filename).expect("Failed to open image");
+    let img = match (args.width, args.height) {
+        (None, None) => img,
+        (w, h) => {
+            let (ow, oh) = (img.width() as u64, img.height() as u64);
+            assert!(ow > 0 && oh > 0, "source image has zero dimension");
+            let (nw, nh) = match (w, h) {
+                (Some(w), Some(h)) => (w, h),
+                // Preserve aspect when only one dimension is given.
+                (Some(w), None) => (w, ((w as u64 * oh) / ow).max(1) as u32),
+                (None, Some(h)) => (((h as u64 * ow) / oh).max(1) as u32, h),
+                (None, None) => unreachable!(),
+            };
+            img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+        }
+    };
     let rgba_data = img.to_rgba8().into_raw();
     let width = img.width() as usize;
 

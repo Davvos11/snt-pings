@@ -14,8 +14,8 @@ ifeq ($(shell $(PKGCONF) --exists libdpdk && echo y),)
 $(error "libdpdk not found by pkg-config. Set PKG_CONFIG_PATH to DPDK's pkgconfig dir.")
 endif
 
-CFLAGS += -O3 -Wall -Wextra $(shell $(PKGCONF) --cflags libdpdk)
-LDFLAGS += $(shell $(PKGCONF) --libs libdpdk)
+CFLAGS += -O3 -Wall -Wextra -pthread $(shell $(PKGCONF) --cflags libdpdk)
+LDFLAGS += -pthread $(shell $(PKGCONF) --libs libdpdk)
 
 $(APP): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(APP) $(LDFLAGS)
