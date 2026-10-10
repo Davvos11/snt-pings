@@ -94,7 +94,14 @@ fn main() {
     };
 
     // ---- pixel -> destination address encoding (same scheme as main.rs) ----
-    let img = image::open(&args.filename).expect("Failed to open image");
+    // Sniff the format from the file's magic bytes rather than its extension,
+    // so extension-less downloads (e.g. from webcam.sh) decode correctly.
+    let img = image::ImageReader::open(&args.filename)
+        .expect("Failed to open image file")
+        .with_guessed_format()
+        .expect("Failed to read image header")
+        .decode()
+        .expect("Failed to decode image");
     let img = match (args.width, args.height) {
         (None, None) => img,
         (w, h) => {

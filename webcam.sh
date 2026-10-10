@@ -56,6 +56,14 @@ mkdir -p "$(dirname "$OUT")"
 # Strip any existing query string; we add our own cache-buster each poll.
 BASE_URL="${URL%%\?*}"
 
+# Give the temp file the right extension so older afxdp builds (which detect the
+# format from the extension) decode it; current afxdp sniffs content regardless.
+ext="${BASE_URL##*.}"
+case "${ext,,}" in
+    jpg|jpeg|png|gif|bmp|webp) : ;;
+    *) ext="jpg" ;;
+esac
+
 TMPDIR="$(mktemp -d)"
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
@@ -64,7 +72,7 @@ trap 'echo; echo ">> stopping webcam poller"; exit 0' INT TERM
 echo ">> polling $BASE_URL -> $OUT at ($X,$Y) every ${INTERVAL}s"
 echo ">> flood it with: sudo $ROOT/dpdk/pingflood -l 0-3 -n 4 -a <PCI> -- @$OUT"
 
-jpg="$TMPDIR/img"            # extension-less; afxdp sniffs the format
+jpg="$TMPDIR/img.$ext"       # extension matches the source format
 while true; do
     # Cache-buster so we always get the freshest frame.
     if curl -fsS --max-time "$INTERVAL" -o "$jpg" "${BASE_URL}?t=$(date +%s%N)"; then
